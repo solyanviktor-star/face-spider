@@ -1,0 +1,31 @@
+<!--
+  Face Spider Skill — index.html
+  Entry point that receives commands from Gemma and passes to webview
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Face Spider</title>
+</head>
+<body>
+  <script>
+    window['ai_edge_gallery_get_result'] = async (data) => {
+      try {
+        const jsonObj = JSON.parse(data);
+        const action = jsonObj.action || 'start';
+        return JSON.stringify({
+          result: `Spider command: ${action}`,
+          webview: {
+            url: `webview.html?action=${encodeURIComponent(action)}`,
+            aspectRatio: 0.75
+          }
+        });
+      } catch (e) {
+        return JSON.stringify({ error: e.message });
+      }
+    };
+  </script>
+</body>
+</html>

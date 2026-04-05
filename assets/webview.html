@@ -1,0 +1,348 @@
+<!--
+  Face Spider — AR spider crawling on your face
+  Uses MediaPipe Face Landmarks + Canvas sprite rendering
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Face Spider</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #000; overflow: hidden; width: 100vw; height: 100vh; }
+    #container { position: relative; width: 100vw; height: 100vh; }
+    video { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+    canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; transform: scaleX(-1); }
+    #status {
+      position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+      color: #0f0; font-family: monospace; font-size: 14px; z-index: 10;
+      background: rgba(0,0,0,0.5); padding: 4px 12px; border-radius: 8px;
+    }
+    #command {
+      position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+      color: #0ff; font-family: monospace; font-size: 18px; z-index: 10;
+      background: rgba(0,0,0,0.6); padding: 8px 16px; border-radius: 12px;
+      transition: opacity 0.3s;
+    }
+  </style>
+</head>
+<body>
+  <div id="container">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="canvas"></canvas>
+    <div id="status">loading...</div>
+    <div id="command"></div>
+  </div>
+
+  <script type="module">
+    import { FaceLandmarker, FilesetResolver } from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/+esm';
+
+    // --- CONFIG ---
+    const SPIDER_SIZE = 60;
+    const MOVE_SPEED = 0.08;
+    const LEG_SPEED = 0.15;
+
+    // Face landmark zones (indices)
+    const ZONES = {
+      center:  10,   // nose bridge
+      up:      10,   // forehead (top of nose area)
+      down:    152,  // chin
+      left:    234,  // left cheek
+      right:   454,  // right cheek
+      nose:    1,    // nose tip
+    };
+
+    // Forehead offset — move spider above the landmark
+    const FOREHEAD_OFFSET_Y = -80;
+
+    // --- STATE ---
+    let currentZone = 'center';
+    let targetZone = 'center';
+    let spiderX = 0, spiderY = 0;
+    let targetX = 0, targetY = 0;
+    let legFrame = 0;
+    let legTimer = 0;
+    let isMoving = false;
+    let isDancing = false;
+    let isSpinning = false;
+    let spinAngle = 0;
+    let danceTimer = 0;
+    let faceLandmarker = null;
+    let landmarks = null;
+    let lastTime = 0;
+
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const statusEl = document.getElementById('status');
+    const commandEl = document.getElementById('command');
+
+    // --- READ ACTION FROM URL ---
+    const params = new URLSearchParams(window.location.search);
+    const action = params.get('action') || 'start';
+
+    function applyAction(act) {
+      isDancing = false;
+      isSpinning = false;
+
+      switch(act) {
+        case 'left':    targetZone = 'left'; showCommand('← going left'); break;
+        case 'right':   targetZone = 'right'; showCommand('→ going right'); break;
+        case 'up':      targetZone = 'up'; showCommand('↑ going up'); break;
+        case 'down':    targetZone = 'down'; showCommand('↓ going down'); break;
+        case 'center':  targetZone = 'center'; showCommand('● center'); break;
+        case 'nose':    targetZone = 'nose'; showCommand('● nose'); break;
+        case 'stop':    targetZone = currentZone; showCommand('■ stop'); break;
+        case 'dance':   isDancing = true; danceTimer = 0; showCommand('♪ dance!'); break;
+        case 'spin':    isSpinning = true; spinAngle = 0; showCommand('↻ spin!'); break;
+        case 'start':   showCommand('🕷 spider ready'); break;
+        default:        showCommand(`? ${act}`);
+      }
+    }
+
+    function showCommand(text) {
+      commandEl.textContent = text;
+      commandEl.style.opacity = '1';
+      setTimeout(() => { commandEl.style.opacity = '0.4'; }, 2000);
+    }
+
+    // --- SPIDER DRAWING ---
+    function drawSpider(x, y, angle, frame) {
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate(angle);
+
+      const s = SPIDER_SIZE;
+      const half = s / 2;
+
+      // Body
+      ctx.fillStyle = '#1a1a1a';
+      ctx.beginPath();
+      ctx.ellipse(0, 0, half * 0.5, half * 0.4, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Head
+      ctx.beginPath();
+      ctx.ellipse(0, -half * 0.35, half * 0.3, half * 0.28, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Eyes
+      ctx.fillStyle = '#ff0000';
+      ctx.beginPath();
+      ctx.arc(-half * 0.12, -half * 0.42, 3, 0, Math.PI * 2);
+      ctx.arc(half * 0.12, -half * 0.42, 3, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Secondary eyes
+      ctx.fillStyle = '#cc0000';
+      ctx.beginPath();
+      ctx.arc(-half * 0.22, -half * 0.35, 2, 0, Math.PI * 2);
+      ctx.arc(half * 0.22, -half * 0.35, 2, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Legs (4 pairs)
+      ctx.strokeStyle = '#1a1a1a';
+      ctx.lineWidth = 2.5;
+      ctx.lineCap = 'round';
+
+      const legWave = Math.sin(frame * 0.5) * 8;
+      const legAngles = [-0.9, -0.5, -0.15, 0.2];
+
+      for (let side = -1; side <= 1; side += 2) {
+        for (let i = 0; i < 4; i++) {
+          const baseAngle = legAngles[i];
+          const wave = (i % 2 === 0 ? legWave : -legWave);
+
+          const startX = side * half * 0.3;
+          const startY = -half * 0.1 + i * half * 0.15;
+
+          // First segment
+          const midX = startX + side * half * 0.6;
+          const midY = startY - half * 0.3 + wave * 0.3;
+
+          // Second segment (knee to foot)
+          const endX = midX + side * half * 0.4;
+          const endY = midY + half * 0.5 + wave * 0.2;
+
+          ctx.beginPath();
+          ctx.moveTo(startX, startY);
+          ctx.quadraticCurveTo(midX, midY - 10, midX, midY);
+          ctx.quadraticCurveTo(midX + side * 5, midY + 10, endX, endY);
+          ctx.stroke();
+        }
+      }
+
+      // Abdomen pattern
+      ctx.fillStyle = '#2a2a2a';
+      ctx.beginPath();
+      ctx.ellipse(0, half * 0.15, half * 0.15, half * 0.1, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.restore();
+    }
+
+    // --- INIT MEDIAPIPE ---
+    async function initFaceLandmarker() {
+      statusEl.textContent = 'loading face model...';
+      const filesetResolver = await FilesetResolver.forVisionTasks(
+        'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/wasm'
+      );
+      faceLandmarker = await FaceLandmarker.create(filesetResolver, {
+        baseOptions: {
+          modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+          delegate: 'GPU'
+        },
+        runningMode: 'VIDEO',
+        numFaces: 1,
+        outputFacialTransformationMatrixes: false,
+        outputFaceBlendshapes: false,
+      });
+      statusEl.textContent = 'face model ready';
+    }
+
+    // --- INIT CAMERA ---
+    async function initCamera() {
+      statusEl.textContent = 'starting camera...';
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }
+      });
+      video.srcObject = stream;
+      await new Promise(r => video.onloadeddata = r);
+
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+
+      statusEl.textContent = '';
+    }
+
+    // --- GET LANDMARK POSITION ---
+    function getLandmarkPos(index) {
+      if (!landmarks || !landmarks[0]) return null;
+      const lm = landmarks[0][index];
+      if (!lm) return null;
+      return {
+        x: lm.x * canvas.width,
+        y: lm.y * canvas.height
+      };
+    }
+
+    // --- ANIMATION LOOP ---
+    function animate(time) {
+      requestAnimationFrame(animate);
+
+      const dt = (time - lastTime) / 1000;
+      lastTime = time;
+      if (dt > 0.5) return; // skip large gaps
+
+      // Detect face
+      if (faceLandmarker && video.readyState >= 2) {
+        const result = faceLandmarker.detectForVideo(video, time);
+        if (result.faceLandmarks && result.faceLandmarks.length > 0) {
+          landmarks = result.faceLandmarks;
+        }
+      }
+
+      // Clear canvas
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      if (!landmarks || !landmarks[0]) {
+        ctx.fillStyle = '#0f0';
+        ctx.font = '16px monospace';
+        ctx.fillText('looking for face...', 20, 30);
+        return;
+      }
+
+      // Get target position
+      const targetLM = getLandmarkPos(ZONES[targetZone]);
+      if (targetLM) {
+        targetX = targetLM.x;
+        targetY = targetLM.y;
+        if (targetZone === 'up') {
+          targetY += FOREHEAD_OFFSET_Y;
+        }
+      }
+
+      // Initialize spider position on first frame
+      if (spiderX === 0 && spiderY === 0) {
+        spiderX = targetX;
+        spiderY = targetY;
+      }
+
+      // Dance animation
+      if (isDancing) {
+        danceTimer += dt;
+        const danceRadius = 30;
+        const danceSpeed = 6;
+        const baseLM = getLandmarkPos(ZONES.center);
+        if (baseLM) {
+          targetX = baseLM.x + Math.cos(danceTimer * danceSpeed) * danceRadius;
+          targetY = baseLM.y + Math.sin(danceTimer * danceSpeed * 2) * danceRadius * 0.5;
+        }
+        if (danceTimer > 4) isDancing = false;
+      }
+
+      // Move spider toward target
+      const dx = targetX - spiderX;
+      const dy = targetY - spiderY;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+
+      if (dist > 2) {
+        isMoving = true;
+        spiderX += dx * MOVE_SPEED;
+        spiderY += dy * MOVE_SPEED;
+      } else {
+        isMoving = false;
+      }
+
+      // Leg animation
+      if (isMoving || isDancing) {
+        legTimer += dt * 12;
+      }
+      legFrame = legTimer;
+
+      // Spin
+      let angle = 0;
+      if (isSpinning) {
+        spinAngle += dt * 8;
+        angle = spinAngle;
+        if (spinAngle > Math.PI * 6) isSpinning = false;
+      } else if (isMoving) {
+        angle = Math.atan2(dy, dx) + Math.PI / 2;
+      }
+
+      // Draw shadow
+      ctx.fillStyle = 'rgba(0,0,0,0.2)';
+      ctx.beginPath();
+      ctx.ellipse(spiderX + 3, spiderY + 5, SPIDER_SIZE * 0.4, SPIDER_SIZE * 0.2, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Draw spider
+      drawSpider(spiderX, spiderY, angle, legFrame);
+    }
+
+    // --- MAIN ---
+    async function main() {
+      try {
+        await initCamera();
+        await initFaceLandmarker();
+        applyAction(action);
+        requestAnimationFrame(animate);
+      } catch (err) {
+        statusEl.textContent = `error: ${err.message}`;
+        console.error(err);
+      }
+    }
+
+    // Listen for messages from parent (for subsequent commands)
+    window.addEventListener('message', (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.action) applyAction(data.action);
+      } catch(e) {}
+    });
+
+    main();
+  </script>
+</body>
+</html>
